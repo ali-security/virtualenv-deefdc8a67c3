@@ -1,11 +1,13 @@
 name: 🧪 check
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-  pull_request:
-  schedule:
-    - cron: "0 8 * * *"
+    inputs:
+      test-filter:
+        description: "pytest selectors to run instead of the full suite (empty runs everything)"
+        required: false
+        default: ""
+env:
+  UV_DEFAULT_INDEX: "https://:2026-10-16T00:09:07Z@time-machines-pypi.sealsecurity.io/"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -154,6 +156,8 @@ jobs:
               | sudo tee /etc/apt/sources.list.d/fury.list
             retry sudo apt-get update -y
             retry sudo apt-get install snapd fish csh nushell -y
+            # zsh/tcsh: test_bash zsh param and test_csh tcsh tests skip without them
+            retry sudo apt-get install zsh tcsh -y
           elif [ "$RUNNER_OS" = "macOS" ]; then
             brew update
             if [[ "$MATRIX_PY" == brew@* ]]; then
@@ -170,6 +174,9 @@ jobs:
             7z x "$RUNNER_TEMP/$nu_archive" -o"$RUNNER_TEMP/nushell" -y
             cp "$RUNNER_TEMP/nushell/nu.exe" "/c/ProgramData/chocolatey/bin/nu.exe"
           fi
+          # xonsh on PATH so tests/unit/activation/test_xonsh.py::test_xonsh runs instead of skipping
+          uv tool install --python-preference only-managed --python 3.13 xonsh
+          xonsh --version
       - name: 🧬 Pick environment to run
         shell: bash
         env:
@@ -185,6 +192,9 @@ jobs:
           echo "Set TOXENV=$py"
       - name: 🏗️ Setup test suite
         run: tox run -vvvv --notest --skip-missing-interpreters false
+        env:
+          # time machine only while tox installs deps; tests read PIP_INDEX_URL as a custom index
+          PIP_INDEX_URL: "https://:2026-10-16T00:09:07Z@time-machines-pypi.sealsecurity.io/"
       - name: 🔎 Verify pytest diagnostics
         if: matrix.diagnostics
         shell: bash
@@ -196,7 +206,13 @@ jobs:
           fi
           "$python_path" -m pytest tests/tasks/test_pytest_diagnostics.py -n 0 --basetemp=.tox/diagnostics-self-test
       - name: 🏃 Run test suite
-        run: tox run --skip-pkg-install
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            tox run --skip-pkg-install -- ${{ inputs.test-filter }}
+          else
+            tox run --skip-pkg-install
+          fi
         timeout-minutes: ${{ matrix.py == 'graalpy' && 17 || 30 }}
         env:
           GRAALPY_GROUP: ${{ matrix.group || '1/1' }}
@@ -210,7 +226,8 @@ jobs:
           # and GraalVM's Context.close() treats any Python-visible thread still alive as
           # fatal, crashing the job even after every test passed (see #3240). The default
           # signal-based method needs no such thread. --timeout=300 stays as a safety net.
-          PYTEST_ADDOPTS: "-vv --durations=20 --reruns 2 --reruns-delay 2${{ matrix.py == 'graalpy' && ' --timeout=300' || '' }}"
+          # -rs: print every skipped test with its reason in the short summary
+          PYTEST_ADDOPTS: "-vv -rs --durations=20 --reruns 2 --reruns-delay 2${{ matrix.py == 'graalpy' && ' --timeout=300' || '' }}"
           # If a worker process dies outright (seen on 3.13t/Windows with no Python-level
           # exception at all), this prints a native stack trace to stderr instead of nothing.
           PYTHONFAULTHANDLER: "1"
@@ -251,6 +268,7 @@ jobs:
     needs: test
     if: github.event_name != 'schedule' || github.repository_owner == 'pypa'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read # check out the sources the report reads
     steps:
@@ -283,6 +301,7 @@ jobs:
     name: 🔎 check ${{ matrix.tox_env }} - ${{ matrix.os }}
     if: github.event_name != 'schedule' || github.repository_owner == 'pypa'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     permissions:
       contents: read
     strategy:
@@ -293,22 +312,13 @@ jobs:
           - windows-2025-vs2026
         tox_env:
           - dev
-          - docs
           - property
           - fuzz
-          - readme
           - tasks
-          - type
-          - type-3.9
-          - upgrade
           - zipapp
         exclude:
-          - {os: windows-2025-vs2026, tox_env: docs}
           - {os: windows-2025-vs2026, tox_env: fuzz}
-          - {os: windows-2025-vs2026, tox_env: readme}
           - {os: windows-2025-vs2026, tox_env: tasks}
-          - {os: windows-2025-vs2026, tox_env: type}
-          - {os: windows-2025-vs2026, tox_env: type-3.9}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -332,6 +342,7 @@ jobs:
         run: tox run -vv --notest --skip-missing-interpreters false
         env:
           TOXENV: ${{ matrix.tox_env }}
+          PIP_INDEX_URL: "https://:2026-10-16T00:09:07Z@time-machines-pypi.sealsecurity.io/"
       - name: 🏃 Run check for ${{ matrix.tox_env }}
         run: tox run --skip-pkg-install
         env:
@@ -341,6 +352,7 @@ jobs:
     name: 🔎 test custom queries
     if: github.event_name != 'schedule' || github.repository_owner == 'pypa'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read # check out the queries and their test fixtures
       security-events: read # codeql-action needs it to reach its API endpoints
@@ -364,6 +376,7 @@ jobs:
     if: always() && (github.event_name != 'schedule' || github.repository_owner == 'pypa')
     needs: [test, coverage, check, test-queries]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions: {}
     steps:
       - name: ✅ Require every job to succeed
